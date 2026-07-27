@@ -1,0 +1,31 @@
+{
+  "name": "pi-toc-outline",
+  "version": "1.0.0",
+  "description": "Interactive Markdown TOC outline for Pi TUI. Zero timeline injection.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "toc",
+    "outline",
+    "markdown",
+    "pi-coding-agent"
+  ],
+  "license": "MIT",
+  "files": [
+    "extensions",
+    "assets",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/toc.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/v587d/pi-toc-outline/v1.0.0/assets/snapshot.png"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
