@@ -79,7 +79,7 @@ const FULL_HEADING_PEEK = 20;
 const DEFAULT_USER_PEEK = 20;
 const FULL_USER_PEEK = 40;
 
-const USER_LABEL_PREVIEW_WIDTH = 40;
+const LABEL_PREVIEW_WIDTH = 40;
 
 /** Extract plain text from a pi-ai message (string or content-block array). */
 function extractText(message: any): string {
@@ -153,7 +153,7 @@ function collectTocItems(ctx: any): TocItem[] {
 
     if (role === "user") {
       const stripped = text.replace(/\n/g, " ");
-      const preview = truncateToWidth(stripped, USER_LABEL_PREVIEW_WIDTH, "…");
+      const preview = truncateToWidth(stripped, LABEL_PREVIEW_WIDTH, "…");
       items.push({
         kind: "user",
         label: `[user]${preview}`,
@@ -161,13 +161,27 @@ function collectTocItems(ctx: any): TocItem[] {
       });
     } else if (role === "assistant") {
       const headings = extractHeadings(text);
-      for (const h of headings) {
+      if (headings.length > 0) {
+        for (const h of headings) {
+          items.push({
+            kind: "heading",
+            level: h.level,
+            title: h.title,
+            lines: h.lines,
+            lineIdx: h.lineIdx,
+          });
+        }
+      } else {
+        // No headings: use first line as a synthetic heading
+        const lines = text.split("\n");
+        const firstLine = lines[0] || "";
+        const title = truncateToWidth(firstLine, LABEL_PREVIEW_WIDTH, "…");
         items.push({
           kind: "heading",
-          level: h.level,
-          title: h.title,
-          lines: h.lines,
-          lineIdx: h.lineIdx,
+          level: 1,
+          title,
+          lines,
+          lineIdx: 0,
         });
       }
     }
