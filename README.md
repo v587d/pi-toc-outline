@@ -26,12 +26,6 @@ Long Pi sessions accumulate many user messages and assistant responses with deep
 pi install git:github.com/v587d/pi-toc-outline@v1.0.0
 ```
 
-Or via HTTPS:
-
-```bash
-pi install https://github.com/v587d/pi-toc-outline@v1.0.0
-```
-
 ## Command
 
 | Command | Description |
