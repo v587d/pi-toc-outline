@@ -23,7 +23,7 @@ Long Pi sessions accumulate many user messages and assistant responses with deep
 ## Install
 
 ```bash
-pi install git:github.com/v587d/pi-toc-outline@v1.0.0
+pi install git:github.com/v587d/pi-toc-outline@v1.1.0
 ```
 
 ## Command
