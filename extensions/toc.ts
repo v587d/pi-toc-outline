@@ -6,9 +6,9 @@
  *   /outline        alias of /toc
  *   alt+o           global shortcut to open the outline modal
  *
- * Modal layout (overlay, full terminal width, up to 100% height):
+ * Modal layout (overlay, fixed height, full terminal width):
  *
- *   ┌─ esc: close   ← default   → full ─── top lines ─┐
+ *   ┌─ ↑↓ select · wheel/PgUp/PgDn scroll · ctrl+x copy · esc close ─ 3/15 entries ─┐
  *   │ [user] Please help me...                         │
  *   │   Section heading         │ rendered Markdown    │
  *   │     Sub heading           │ of the peek region   │
@@ -17,10 +17,11 @@
  *   └──────────────────────────────────────────────────┘
  *
  * Keys:
- *   Esc     close
- *   ↑ / ↓   move selection
- *   ←       switch to default height (≈ 12 list rows, 10/20 peek lines)
- *   →       switch to full height    (≈ 24 list rows, 20/40 peek lines)
+ *   Esc            close
+ *   ↑ / ↓          move selection (left panel)
+ *   PgUp/Dn        scroll preview (right panel)
+ *   Wheel          scroll preview (right panel)
+ *   ctrl+x         copy selected markdown to clipboard
  *
  * Left column:
  *   - User messages become a single un-indented entry: [user]<first 40 columns>
@@ -35,8 +36,9 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { highlightCode } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, highlightCode } from "@earendil-works/pi-coding-agent";
 import {
+  Key,
   Markdown,
   type MarkdownTheme,
   SelectList,
@@ -44,7 +46,10 @@ import {
   matchesKey,
   visibleWidth,
   truncateToWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+
+// ── types ────────────────────────────────────────────────────────────────────
 
 interface Heading {
   level: number;
@@ -55,31 +60,31 @@ interface Heading {
 
 interface UserTocItem {
   kind: "user";
-  label: string;
+  level: number; // always 1
+  title: string; // preview text (no [user] prefix)
   lines: string[];
 }
 
 interface HeadingTocItem {
   kind: "heading";
-  level: number;
-  title: string;
+  level: number; // base 2 + original # count: 0#→2, 1#→3, 2#→4, n#→n+2
+  title: string; // heading text without # prefix
   lines: string[];
   lineIdx: number;
 }
 
 type TocItem = UserTocItem | HeadingTocItem;
-type ViewMode = "default" | "full";
+
+// ── constants ────────────────────────────────────────────────────────────────
 
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
 
-const DEFAULT_LIST_ROWS = 12;
-const FULL_LIST_ROWS = 24;
-const DEFAULT_HEADING_PEEK = 10;
-const FULL_HEADING_PEEK = 20;
-const DEFAULT_USER_PEEK = 20;
-const FULL_USER_PEEK = 40;
+const LABEL_PREVIEW_WIDTH = 80;
 
-const LABEL_PREVIEW_WIDTH = 40;
+/** Fixed overlay chrome rows outside the body viewport: top-border + header + rule + bottom-border. */
+const TOC_OVERLAY_CHROME_LINES = 4;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 /** Extract plain text from a pi-ai message (string or content-block array). */
 function extractText(message: any): string {
@@ -126,13 +131,16 @@ function extractHeadings(text: string): Heading[] {
   return headings;
 }
 
-/** Build the visible label for a TOC item. */
-function buildLabel(item: TocItem): string {
-  if (item.kind === "user") {
-    return item.label;
-  }
+/** Build the visible label for a TOC item. No #-prefixes — hierarchy is conveyed by indentation alone. */
+function buildLabel(item: TocItem, theme: any): string {
   const indent = "  ".repeat(item.level - 1);
-  return `${indent}${item.title}`;
+  const text = item.title;
+  if (item.kind === "user") {
+    // User messages: orange bold, level 1 (no indent)
+    return `${indent}${theme.fg("warning", theme.bold(text))}`;
+  }
+  // All assistant items: plain text with level-based indent
+  return `${indent}${text}`;
 }
 
 /** Collect TOC items from the current session. */
@@ -156,29 +164,32 @@ function collectTocItems(ctx: any): TocItem[] {
       const preview = truncateToWidth(stripped, LABEL_PREVIEW_WIDTH, "…");
       items.push({
         kind: "user",
-        label: `[user]${preview}`,
+        level: 1,
+        title: preview,
         lines: text.split("\n"),
       });
     } else if (role === "assistant") {
       const headings = extractHeadings(text);
       if (headings.length > 0) {
         for (const h of headings) {
+          // Level = base 2 + original heading count.  0# → 2, 1# → 3, 2# → 4, n# → n+2.
+          const shiftedLevel = h.level + 2;
           items.push({
             kind: "heading",
-            level: h.level,
+            level: shiftedLevel,
             title: h.title,
             lines: h.lines,
             lineIdx: h.lineIdx,
           });
         }
       } else {
-        // No headings: use first line as a synthetic heading
+        // No headings: level 2 (base assistant indent)
         const lines = text.split("\n");
         const firstLine = lines[0] || "";
         const title = truncateToWidth(firstLine, LABEL_PREVIEW_WIDTH, "…");
         items.push({
           kind: "heading",
-          level: 1,
+          level: 2,
           title,
           lines,
           lineIdx: 0,
@@ -189,6 +200,60 @@ function collectTocItems(ctx: any): TocItem[] {
   return items;
 }
 
+/** Compute a fixed dialog height based on terminal size (matches BTW's approach). */
+function getDialogHeight(): number {
+  const terminalRows = process.stdout.rows ?? 30;
+  return Math.max(18, Math.min(36, Math.floor(terminalRows * 0.85)));
+}
+
+// ── overlay rendering helpers ────────────────────────────────────────────────
+
+/** Build a framed border line like ┌──...──┐ using the "warning" (yellow) colour. */
+function borderLine(
+  innerWidth: number,
+  edge: "top" | "bottom",
+  theme: any,
+): string {
+  const left = edge === "top" ? "┌" : "└";
+  const right = edge === "top" ? "┐" : "┘";
+  return theme.fg("warning", `${left}${"─".repeat(innerWidth)}${right}`);
+}
+
+/** Build a framed rule line like ├──...──┤. */
+function ruleLine(innerWidth: number, theme: any): string {
+  return theme.fg("warning", `├${"─".repeat(innerWidth)}┤`);
+}
+
+/** Build a single framed content line like │ content         │. */
+function frameLine(
+  content: string,
+  innerWidth: number,
+  theme: any,
+): string {
+  const truncated = truncateToWidth(content, innerWidth, "");
+  const padding = Math.max(0, innerWidth - visibleWidth(truncated));
+  return `${theme.fg("warning", "│")}${truncated}${" ".repeat(padding)}${theme.fg("warning", "│")}`;
+}
+
+/** Strip potential cursor-marker sequences from a rendered line so they don't
+ *  skew overlay width calculations. */
+function sanitizeRenderedLine(line: string): string {
+  return line.replace(/\x1b_\x1b\\/g, "");
+}
+
+/** Get the lines for the right preview panel, trimmed to a max peek count. */
+function getPreviewLines(item: TocItem): string[] {
+  const headingPeek = 30;
+  const userPeek = 50;
+
+  if (item.kind === "user") {
+    return item.lines.slice(0, userPeek);
+  }
+  return item.lines.slice(item.lineIdx, item.lineIdx + headingPeek);
+}
+
+// ── main open function ───────────────────────────────────────────────────────
+
 async function openToc(ctx: any) {
   const tocItems = collectTocItems(ctx);
   if (tocItems.length === 0) {
@@ -198,186 +263,237 @@ async function openToc(ctx: any) {
 
   const themeRef = ctx.ui.theme;
 
+  // ── mutable state ────────────────────────────────────────────────────────
+  let currentIdx = 0;
+  let rightScrollOffset = 0; // how many lines the right preview is scrolled
+  let followRight = false; // auto-scroll to bottom of preview on selection change; starts at top
+
+  // ── build SelectLists ────────────────────────────────────────────────────
   const items: SelectItem[] = tocItems.map((item, i) => ({
     value: String(i),
-    label: buildLabel(item),
+    label: buildLabel(item, themeRef),
   }));
 
-  const listDefault = new SelectList(
-    items,
-    Math.min(items.length, DEFAULT_LIST_ROWS),
-    {
-      selectedPrefix: (s) => themeRef.fg("accent", s),
-      selectedText: (s) => themeRef.fg("accent", themeRef.bold(s)),
-      description: (s) => themeRef.fg("muted", s),
-      scrollInfo: (s) => themeRef.fg("dim", s),
-      noMatch: (s) => themeRef.fg("warning", s),
-    },
-  );
-  const listFull = new SelectList(
-    items,
-    Math.min(items.length, FULL_LIST_ROWS),
-    {
-      selectedPrefix: (s) => themeRef.fg("accent", s),
-      selectedText: (s) => themeRef.fg("accent", themeRef.bold(s)),
-      description: (s) => themeRef.fg("muted", s),
-      scrollInfo: (s) => themeRef.fg("dim", s),
-      noMatch: (s) => themeRef.fg("warning", s),
-    },
-  );
-  listDefault.onSelect = () => {};
-  listFull.onSelect = () => {};
+  const dialogHeight = getDialogHeight();
+  const viewportHeight = dialogHeight - TOC_OVERLAY_CHROME_LINES;
+  const listRows = Math.min(items.length, viewportHeight);
 
-  let currentIdx = 0;
-  let mode: ViewMode = "default";
-
-  await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-    const markdownTheme: MarkdownTheme = {
-      heading: (t) => theme.fg("accent", theme.bold(t)),
-      link: (t) => theme.fg("accent", t),
-      linkUrl: (t) => theme.fg("dim", t),
-      code: (t) => theme.fg("accent", t),
-      codeBlock: (t) => theme.fg("muted", t),
-      codeBlockBorder: (t) => theme.fg("dim", t),
-      quote: (t) => theme.fg("dim", t),
-      quoteBorder: (t) => theme.fg("dim", t),
-      hr: (t) => theme.fg("dim", t),
-      listBullet: (t) => theme.fg("muted", t),
-      bold: (t) => theme.bold(t),
-      italic: (t) => theme.italic(t),
-      strikethrough: (t) => theme.strikethrough(t),
-      underline: (t) => theme.underline(t),
-      highlightCode: (code, lang) => highlightCode(code, lang ?? undefined, theme),
-    };
-
-    const markdown = new Markdown("", 0, 0, markdownTheme);
-
-    const getPeekLines = () =>
-      mode === "default"
-        ? { heading: DEFAULT_HEADING_PEEK, user: DEFAULT_USER_PEEK }
-        : { heading: FULL_HEADING_PEEK, user: FULL_USER_PEEK };
-
-    const getActiveList = () => (mode === "default" ? listDefault : listFull);
-
-    const updatePeek = () => {
-      const item = tocItems[currentIdx];
-      if (!item) {
-        markdown.setText("");
-        return;
-      }
-      const counts = getPeekLines();
-      if (item.kind === "user") {
-        markdown.setText(item.lines.slice(0, counts.user).join("\n"));
-      } else {
-        markdown.setText(
-          item.lines
-            .slice(item.lineIdx, item.lineIdx + counts.heading)
-            .join("\n"),
-        );
-      }
-    };
-
-    const onSelectionChange = (item: SelectItem | null) => {
-      currentIdx = item ? Number(item.value) : 0;
-      updatePeek();
-    };
-    listDefault.onSelectionChange = onSelectionChange;
-    listFull.onSelectionChange = onSelectionChange;
-    updatePeek();
-
-    const render = (width: number): string[] => {
-      const top = theme.fg("muted", "─".repeat(width));
-
-      const esc = theme.fg("dim", "esc: close");
-      const defaultLabel =
-        mode === "default"
-          ? theme.fg("accent", "default")
-          : theme.fg("dim", "default");
-      const fullLabel =
-        mode === "full"
-          ? theme.fg("accent", "full")
-          : theme.fg("dim", "full");
-      const leftHeader = `${esc}   ${theme.fg("dim", "← ")}${defaultLabel}${theme.fg(
-        "dim",
-        "   → ",
-      )}${fullLabel}`;
-      const rightHeader = theme.fg("accent", "top lines");
-      const gap = width - 2 - visibleWidth(leftHeader) - visibleWidth(rightHeader);
-      const header =
-        gap >= 2
-          ? ` ${leftHeader}${" ".repeat(gap)}${rightHeader} `
-          : ` ${leftHeader} `;
-
-      const innerW = width - 2;
-      const leftW = Math.max(20, Math.floor(innerW * 0.4));
-      const sep = theme.fg("dim", " │ ");
-      const sepW = 3;
-      const rightW = Math.max(10, innerW - leftW - sepW);
-
-      const activeList = getActiveList();
-      const leftLines = activeList.render(leftW);
-      const rightLines = markdown.render(rightW);
-
-      const rows = Math.max(leftLines.length, rightLines.length);
-      const body: string[] = [];
-      for (let i = 0; i < rows; i++) {
-        const l = leftLines[i] ?? "";
-        const lw = visibleWidth(l);
-        const lpad = lw < leftW ? " ".repeat(leftW - lw) : "";
-        const r = rightLines[i] ?? "";
-        body.push(` ${l}${lpad}${sep}${r} `);
-      }
-
-      const bottom = theme.fg("muted", "─".repeat(width));
-      return [top, header, ...body, bottom];
-    };
-
-    return {
-      render,
-      invalidate() {
-        listDefault.invalidate();
-        listFull.invalidate();
-        markdown.invalidate();
-      },
-      handleInput(data: string) {
-        if (matchesKey(data, "escape")) {
-          done();
-          return;
-        }
-        if (matchesKey(data, "up") || matchesKey(data, "down")) {
-          getActiveList().handleInput(data);
-          tui.requestRender();
-          return;
-        }
-        if (matchesKey(data, "left")) {
-          if (mode !== "default") {
-            mode = "default";
-            listDefault.setSelectedIndex(currentIdx);
-            updatePeek();
-            tui.requestRender();
-          }
-          return;
-        }
-        if (matchesKey(data, "right")) {
-          if (mode !== "full") {
-            mode = "full";
-            listFull.setSelectedIndex(currentIdx);
-            updatePeek();
-            tui.requestRender();
-          }
-          return;
-        }
-      },
-    };
-  }, {
-    overlay: true,
-    overlayOptions: {
-      anchor: "center",
-      width: "100%",
-      maxHeight: "100%",
-    },
+  const selectList = new SelectList(items, listRows, {
+    selectedPrefix: (s) => themeRef.fg("accent", s),
+    selectedText: (s) => themeRef.fg("accent", themeRef.bold(s)),
+    description: (s) => themeRef.fg("muted", s),
+    scrollInfo: (s) => themeRef.fg("dim", s),
+    noMatch: (s) => themeRef.fg("warning", s),
   });
+  selectList.onSelect = () => {};
+
+  const markdownTheme: MarkdownTheme = {
+    heading: (t) => themeRef.fg("accent", themeRef.bold(t)),
+    link: (t) => themeRef.fg("accent", t),
+    linkUrl: (t) => themeRef.fg("dim", t),
+    code: (t) => themeRef.fg("accent", t),
+    codeBlock: (t) => themeRef.fg("muted", t),
+    codeBlockBorder: (t) => themeRef.fg("dim", t),
+    quote: (t) => themeRef.fg("dim", t),
+    quoteBorder: (t) => themeRef.fg("dim", t),
+    hr: (t) => themeRef.fg("dim", t),
+    listBullet: (t) => themeRef.fg("muted", t),
+    bold: (t) => themeRef.bold(t),
+    italic: (t) => themeRef.italic(t),
+    strikethrough: (t) => themeRef.strikethrough(t),
+    underline: (t) => themeRef.underline(t),
+    highlightCode: (code, lang) => highlightCode(code, lang ?? undefined, themeRef),
+  };
+
+  const markdown = new Markdown("", 0, 0, markdownTheme);
+
+  // ── peek logic ───────────────────────────────────────────────────────────
+  const updatePeek = () => {
+    const item = tocItems[currentIdx];
+    if (!item) {
+      markdown.setText("");
+      rightScrollOffset = 0;
+      return;
+    }
+    const rawLines = getPreviewLines(item);
+    markdown.setText(rawLines.join("\n"));
+    // Reset to top on selection change (don't jump to bottom)
+    followRight = false;
+    rightScrollOffset = 0;
+  };
+
+  const onSelectionChange = (item: SelectItem | null) => {
+    currentIdx = item ? Number(item.value) : 0;
+    updatePeek();
+  };
+  selectList.onSelectionChange = onSelectionChange;
+  updatePeek();
+
+  // ── mouse scroll ─────────────────────────────────────────────────────────
+  function getMouseScrollDelta(data: string): number | null {
+    const match = data.match(/^\x1b\[<(\d+);\d+;\d+[Mm]$/);
+    if (!match) return null;
+    const button = Number(match[1]);
+    if ((button & 64) !== 64) return null;
+    return (button & 1) === 0 ? -3 : 3;
+  }
+
+  // ── open overlay ─────────────────────────────────────────────────────────
+  await ctx.ui.custom<void>(
+    (tui, theme, _kb, done) => {
+      // Enable SGR mouse reporting so wheel / touchpad events reach handleInput.
+      tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+
+      const render = (width: number): string[] => {
+        const dialogWidth = Math.max(24, width);
+        const innerWidth = Math.max(22, dialogWidth - 2);
+
+        // Split body into left / right
+        const leftW = Math.max(24, Math.floor(innerWidth * 0.5));
+        const sepStr = theme.fg("warning", " │ ");
+        const sepW = 3;
+        const rightW = Math.max(10, innerWidth - leftW - sepW);
+
+        // Left panel: SelectList renders exactly listHeight lines
+        const rawLeft = selectList.render(leftW);
+        const leftLines = rawLeft.map(sanitizeRenderedLine);
+
+        // Right panel: render markdown then wrap to rightW
+        const rightRaw = markdown.render(rightW);
+        const rightLines: string[] = [];
+        for (const line of rightRaw) {
+          if (!line) {
+            rightLines.push("");
+            continue;
+          }
+          rightLines.push(...wrapTextWithAnsi(sanitizeRenderedLine(line), Math.max(1, rightW)));
+        }
+
+        // Clamp right scroll
+        const maxRightScroll = Math.max(0, rightLines.length - viewportHeight);
+        if (followRight) {
+          rightScrollOffset = maxRightScroll;
+        } else {
+          rightScrollOffset = Math.max(0, Math.min(rightScrollOffset, maxRightScroll));
+          if (rightScrollOffset >= maxRightScroll) {
+            followRight = true;
+          }
+        }
+
+        const visibleRight = rightLines.slice(
+          rightScrollOffset,
+          rightScrollOffset + viewportHeight,
+        );
+
+        // Both panels fill exactly viewportHeight rows
+        const bodyLines: string[] = [];
+        for (let i = 0; i < viewportHeight; i++) {
+          const l = leftLines[i] ?? "";
+          const r = visibleRight[i] ?? "";
+          const lw = visibleWidth(l);
+          const lpad = lw < leftW ? " ".repeat(leftW - lw) : "";
+          bodyLines.push(`${l}${lpad}${sepStr}${r}`);
+        }
+
+        // Scroll info for right panel overflow
+        const hiddenRightAbove = rightScrollOffset;
+        const hiddenRightBelow = Math.max(0, maxRightScroll - rightScrollOffset);
+        const scrollInfo =
+          hiddenRightAbove || hiddenRightBelow
+            ? `  preview ↑${hiddenRightAbove} ↓${hiddenRightBelow}`
+            : "";
+
+        // Header (hints + entry count)
+        const leftHeader = theme.fg("dim", `↑↓ select · wheel/PgUp/PgDn scroll · ctrl+x copy · esc close${scrollInfo}`);
+        const rightHeader = theme.fg("accent", `${currentIdx + 1}/${tocItems.length} entries`);
+        const gap = innerWidth - visibleWidth(leftHeader) - visibleWidth(rightHeader);
+        const headerStr =
+          gap >= 2
+            ? `${leftHeader}${" ".repeat(gap)}${rightHeader}`
+            : leftHeader;
+
+        // Assemble full dialog (fixed height)
+        const lines: string[] = [];
+        lines.push(borderLine(innerWidth, "top", theme));
+        lines.push(frameLine(headerStr, innerWidth, theme));
+        lines.push(ruleLine(innerWidth, theme));
+        for (const bl of bodyLines) {
+          lines.push(frameLine(bl, innerWidth, theme));
+        }
+        lines.push(borderLine(innerWidth, "bottom", theme));
+
+        return lines;
+      };
+
+      return {
+        render,
+        invalidate() {
+          selectList.invalidate();
+          markdown.invalidate();
+        },
+        handleInput(data: string) {
+          // Mouse scroll
+          const mouseDelta = getMouseScrollDelta(data);
+          if (mouseDelta !== null) {
+            followRight = false;
+            rightScrollOffset = Math.max(
+              0,
+              rightScrollOffset + mouseDelta,
+            );
+            tui.requestRender();
+            return;
+          }
+
+          if (matchesKey(data, "escape")) {
+            done();
+            return;
+          }
+
+          if (matchesKey(data, "page_up") || matchesKey(data, "page_down")) {
+            followRight = false;
+            const step = viewportHeight - 2;
+            const delta = matchesKey(data, "page_up") ? -step : step;
+            rightScrollOffset = Math.max(0, rightScrollOffset + delta);
+            tui.requestRender();
+            return;
+          }
+
+          if (matchesKey(data, "up") || matchesKey(data, "down")) {
+            selectList.handleInput(data);
+            tui.requestRender();
+            return;
+          }
+
+          if (matchesKey(data, Key.ctrl("x"))) {
+            const item = tocItems[currentIdx];
+            if (item) {
+              // Copy full original markdown, not just the peek slice
+              const text =
+                item.kind === "user"
+                  ? item.lines.join("\n")
+                  : item.lines.slice(item.lineIdx).join("\n");
+              copyToClipboard(text).catch(() => {});
+            }
+            return;
+          }
+        },
+        dispose() {
+          tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+        },
+      };
+    },
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "center",
+        width: "100%",
+        maxHeight: "100%",
+      },
+    },
+  );
 }
+
+// ── extension entry ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("toc", {
