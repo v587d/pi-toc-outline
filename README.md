@@ -1,6 +1,6 @@
 # pi-toc-outline
 
-Interactive Markdown table-of-contents outline for [Pi](https://pi.dev) TUI.
+Pi extension for interactive Markdown table-of-contents outline in the Pi TUI.
 
 ![demo](./assets/demo.png)
 
