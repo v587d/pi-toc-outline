@@ -1,6 +1,6 @@
 {
   "name": "pi-toc-outline",
-  "version": "1.2.1",
+  "version": "1.1.0",
   "description": "Interactive Markdown TOC outline for Pi TUI. Zero timeline injection.",
   "type": "module",
   "keywords": [
