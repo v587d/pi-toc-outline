@@ -36,11 +36,15 @@
  *
  * Fullscreen mode (pi >= 0.84, --tui-mode fullscreen / /settings):
  *   - A markdown transformer injects OSC 133 prompt markers (\x1b]133;A) before
- *     every assistant heading, so the built-in "jump to previous/next marked
+ *     every assistant heading. The built-in "jump to previous/next marked
  *     message" shortcuts (tui.altScreen.previousPrompt/nextPrompt, default
- *     ctrl+shift+up/down) navigate the transcript heading-by-heading.
- *   - /toc opens as a left sidebar: the TOC stays visible while the transcript
- *     (right side) keeps native wheel/page scrolling and ctrl+shift+↑/↓ jumps.
+ *     ctrl+shift+up/down) only match markers at the true line start, so they
+ *     stay at message boundaries (pi pads every Markdown line by outputPad
+ *     columns, pushing text-layer markers off the line start).
+ *   - The /toc dialog (centered, wider in fullscreen) adds `Enter`: it locates
+ *     the selected entry's jump anchor via a whitespace-tolerant scan of the
+ *     transcript and scrolls to that exact line — this is the heading-level
+ *     jump (computeJumpAnchors + jumpToMarkerIndex).
  *   - The markers are display-only: pi strips them before writing the screen and
  *     they never enter the session or LLM context (official display-only hook
  *     pi.registerMarkdownTransformer, added in 0.84).
@@ -104,9 +108,14 @@ const LABEL_PREVIEW_WIDTH = 80;
  */
 export const JUMP_MARKER = "\x1b]133;A\x07";
 
-/** Exact regex pi's fullscreen TUI (TuiAltScreen.scrollToPrompt) uses to find
- *  jump anchors in rendered transcript lines. Mirrors tui-alt-screen.js. */
-export const OSC133_PROMPT_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
+/** Regex used by jumpToMarkerIndex to locate jump anchors in rendered transcript
+ *  lines. Loose on leading whitespace because pi's Markdown component pads every
+ *  line by outputPad (default 1) columns, so text-layer markers render as
+ *  `" \x1b]133;A\x07..."` rather than at the very start of the line.
+ *  (pi's own scrollToPrompt only matches the strict line-start form — that is why
+ *  the built-in Ctrl+Shift+↑/↓ keys stop at message boundaries, while our Enter
+ *  jump can reach heading anchors.) */
+export const OSC133_PROMPT_START = /^\s*\x1b\]133;A(?:\x07|\x1b\\)/;
 
 /** Insert a JUMP_MARKER line before every top-level Markdown heading, skipping
  *  fenced code blocks. Must mirror extractHeadings() so the transcript jump
@@ -496,40 +505,7 @@ async function openToc(ctx: any) {
         const dialogWidth = Math.max(24, width);
         const innerWidth = Math.max(22, dialogWidth - 2);
 
-        // ── fullscreen sidebar: single-column TOC, transcript live on the right ──
-        if (isFullscreen) {
-          const rawList = selectList.render(innerWidth);
-          const listLines = rawList.map(sanitizeRenderedLine);
-
-          const bodyLines: string[] = [];
-          for (let i = 0; i < viewportHeight; i++) {
-            bodyLines.push(listLines[i] ?? "");
-          }
-
-          const hint = theme.fg(
-            "dim",
-            `↑↓ · ctrl+shift+↑/↓ jump · esc close`,
-          );
-          const count = theme.fg("accent", `${currentIdx + 1}/${tocItems.length}`);
-          const headerStr =
-            visibleWidth(hint) + visibleWidth(count) + 2 <= innerWidth
-              ? `${hint}${" ".repeat(
-                  innerWidth - visibleWidth(hint) - visibleWidth(count),
-                )}${count}`
-              : hint;
-
-          const lines: string[] = [];
-          lines.push(borderLine(innerWidth, "top", theme));
-          lines.push(frameLine(headerStr, innerWidth, theme));
-          lines.push(ruleLine(innerWidth, theme));
-          for (const bl of bodyLines) {
-            lines.push(frameLine(bl, innerWidth, theme));
-          }
-          lines.push(borderLine(innerWidth, "bottom", theme));
-          return lines;
-        }
-
-        // ── regular dialog: two-panel TOC + preview (unchanged) ────────────────
+        // ── two-panel TOC + preview (both modes; fullscreen is a wider centered dialog) ──
         // Split body into left / right
         const leftW = Math.max(24, Math.floor(innerWidth * 0.5));
         const sepStr = theme.fg("warning", " │ ");
@@ -585,8 +561,13 @@ async function openToc(ctx: any) {
             ? `  preview ↑${hiddenRightAbove} ↓${hiddenRightBelow}`
             : "";
 
-        // Header (hints + entry count)
-        const leftHeader = theme.fg("dim", `↑↓ select · wheel/PgUp/PgDn scroll · ctrl+x copy · esc close${scrollInfo}`);
+        // Header (hints + entry count). Fullscreen mode advertises the jump
+        // keys; wheel/PgUp/PgDn scroll the transcript there (native viewport),
+        // not the preview panel.
+        const hintBase = isFullscreen
+          ? `↑↓ select · ctrl+shift+↑/↓ jump · enter jump · ctrl+x copy · esc close`
+          : `↑↓ select · wheel/PgUp/PgDn scroll · ctrl+x copy · esc close`;
+        const leftHeader = theme.fg("dim", `${hintBase}${scrollInfo}`);
         const rightHeader = theme.fg("accent", `${currentIdx + 1}/${tocItems.length} entries`);
         const gap = innerWidth - visibleWidth(leftHeader) - visibleWidth(rightHeader);
         const headerStr =
@@ -646,8 +627,8 @@ async function openToc(ctx: any) {
             return;
           }
 
-          // Fullscreen sidebar: Enter jumps the transcript to the selected
-          // heading/message anchor, then closes the panel. Falls back to native
+          // Fullscreen dialog: Enter jumps the transcript to the selected
+          // heading/message anchor, then closes the dialog. Falls back to native
           // ctrl+shift+↑/↓ hints when pi's internal viewport layout is not
           // available (different pi version or regular mode).
           if (isFullscreen && matchesKey(data, "enter")) {
@@ -695,13 +676,15 @@ async function openToc(ctx: any) {
     },
     {
       overlay: true,
-      // Mode-dependent placement: sidebar (fullscreen) vs centered dialog.
-      // Evaluated after the factory captures tui.mode.
+      // Mode-dependent placement: a wider centered dialog (fullscreen) vs the
+      // classic full-width dialog (regular). Both keep the two-panel layout in
+      // spirit; fullscreen leaves ~12% on each side so the transcript stays
+      // visible for live jumps.
       overlayOptions: () =>
         tuiMode === "fullscreen"
           ? {
-              anchor: "left-center",
-              width: "45%",
+              anchor: "center",
+              width: "75%",
               maxHeight: "100%",
             }
           : {

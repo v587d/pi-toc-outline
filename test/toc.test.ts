@@ -4,22 +4,26 @@
  * Verifies:
  *  1. injectHeadingJumpMarkers() — pure text transform (fences, nested, etc.)
  *  2. Marker survives the real pi-tui Markdown render pipeline at line start
- *  3. Rendered marker line is matched by the exact regex the fullscreen TUI
- *     (TuiAltScreen.scrollToPrompt) uses to find jump anchors
+ *  3. Rendered marker line is matched by the jump-anchor regex the extension
+ *     uses (loose on leading whitespace to tolerate pi's outputPad padding)
+ *  4. computeJumpAnchors() — jump-anchor arithmetic mirrors pi's marker rules
+ *  5. jumpToMarkerIndex() — exact scrolling + graceful degradation
  *
- * Run: bun test extensions/toc.test.ts
+ * Run: bun test
  */
 import { describe, expect, test } from "bun:test";
 import { Markdown } from "@earendil-works/pi-tui";
 import {
   JUMP_MARKER,
+  OSC133_PROMPT_START,
   computeJumpAnchors,
   injectHeadingJumpMarkers,
   jumpToMarkerIndex,
 } from "../extensions/toc.ts";
 
-/** Exact regex from pi-tui dist/tui-alt-screen.js (scrollToPrompt). */
-const OSC133_PROMPT_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
+/** pi's own strict line-start regex (TuiAltScreen.scrollToPrompt) — used to
+ *  assert that markers sit at the true line start when there is no padding. */
+const STRICT_LINE_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
 
 const theme: Record<string, (t: string) => string> = {
   heading: (t) => t,
@@ -79,12 +83,36 @@ describe("injectHeadingJumpMarkers", () => {
     md.setText("# Section One\nsome text\n\n## Sub Two\nmore\n");
     const lines = md.render(80);
 
-    const matches = lines.filter((l) => OSC133_PROMPT_START.test(l));
+    // With paddingX=0 the marker sits at the true line start (pi's strict
+    // scrollToPrompt regex would also match).
+    const matches = lines.filter((l) => STRICT_LINE_START.test(l));
     expect(matches.length).toBe(2); // one per heading
     // marker lines render as zero-visible-width lines (invisible on screen)
     for (const m of matches) {
-      const stripped = m.replace(OSC133_PROMPT_START, "");
+      const stripped = m.replace(STRICT_LINE_START, "");
       expect(stripped.trim().length).toBe(0);
+    }
+  });
+
+  test("markers survive with real pi outputPad padding (paddingX=1)", () => {
+    // pi renders assistant message markdown with paddingX = outputPad (default 1),
+    // so injected marker lines become " \x1b]133;A\x07...". pi's strict
+    // scrollToPrompt regex does NOT match those (native Ctrl+Shift+↑/↓ therefore
+    // stays at message boundaries), but our loose regex does — that is what makes
+    // the Enter exact jump reach headings.
+    const md = new Markdown("", 1, 0, theme as any, undefined, {
+      transform: (text) => injectHeadingJumpMarkers(text),
+    });
+    md.setText("# Section One\n\n## Sub Two\n");
+    const lines = md.render(80);
+
+    const looseMatches = lines.filter((l) => OSC133_PROMPT_START.test(l));
+    expect(looseMatches.length).toBe(2);
+    // pi's strict regex must NOT match the padded marker lines
+    expect(lines.filter((l) => STRICT_LINE_START.test(l)).length).toBe(0);
+    // each marker line starts with exactly outputPad spaces before the marker
+    for (const m of looseMatches) {
+      expect(/^\s*\x1b\]133;A\x07/.test(m)).toBe(true);
     }
   });
 
@@ -172,10 +200,10 @@ describe("jumpToMarkerIndex", () => {
   test("scrolls to the k-th marker row exactly", () => {
     const lines = [
       "header line",
-      `${marker}user msg`,     // anchor 0 at row 1
-      `${marker}# heading A`,  // anchor 1 at row 2
+      `${marker}user msg`,     // anchor 0 at row 1 (component-layer marker, no padding)
+      ` ${marker}# heading A`, // anchor 1 at row 2 (text-layer marker, outputPad=1 padding)
       "text",
-      `${marker}## heading B`, // anchor 2 at row 4
+      ` ${marker}## heading B`, // anchor 2 at row 4
       "more",
     ];
     const { tui, scrollView } = makeTui(lines);
@@ -183,6 +211,8 @@ describe("jumpToMarkerIndex", () => {
     expect(scrollView.called).toBe(4);
     expect(jumpToMarkerIndex(tui, 0)).toBe(true);
     expect(scrollView.called).toBe(1);
+    expect(jumpToMarkerIndex(tui, 1)).toBe(true);
+    expect(scrollView.called).toBe(2);
   });
 
   test("returns false when the anchor index is out of range", () => {
