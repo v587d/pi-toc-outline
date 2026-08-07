@@ -33,6 +33,17 @@
  *
  * Zero timeline injection: nothing is written to the session, nothing enters
  * LLM context. The modal is pure TUI state and disappears when closed.
+ *
+ * Fullscreen mode (pi >= 0.84, --tui-mode fullscreen / /settings):
+ *   - A markdown transformer injects OSC 133 prompt markers (\x1b]133;A) before
+ *     every assistant heading, so the built-in "jump to previous/next marked
+ *     message" shortcuts (tui.altScreen.previousPrompt/nextPrompt, default
+ *     ctrl+shift+up/down) navigate the transcript heading-by-heading.
+ *   - /toc opens as a left sidebar: the TOC stays visible while the transcript
+ *     (right side) keeps native wheel/page scrolling and ctrl+shift+↑/↓ jumps.
+ *   - The markers are display-only: pi strips them before writing the screen and
+ *     they never enter the session or LLM context (official display-only hook
+ *     pi.registerMarkdownTransformer, added in 0.84).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -80,6 +91,134 @@ type TocItem = UserTocItem | HeadingTocItem;
 const HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/;
 
 const LABEL_PREVIEW_WIDTH = 80;
+
+/**
+ * OSC 133 semantic-prompt start marker ("Prompt A"). The fullscreen TUI
+ * (TuiAltScreen) scans rendered transcript lines for lines starting with this
+ * marker to implement the "jump to previous/next marked message" shortcuts
+ * (tui.altScreen.previousPrompt/nextPrompt, default ctrl+shift+up/down).
+ *
+ * Injecting one before each Markdown heading turns the native message-level
+ * jump into a heading-level jump. Pi strips these markers before writing the
+ * screen (they are invisible) and never stores them in the session.
+ */
+export const JUMP_MARKER = "\x1b]133;A\x07";
+
+/** Exact regex pi's fullscreen TUI (TuiAltScreen.scrollToPrompt) uses to find
+ *  jump anchors in rendered transcript lines. Mirrors tui-alt-screen.js. */
+export const OSC133_PROMPT_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
+
+/** Insert a JUMP_MARKER line before every top-level Markdown heading, skipping
+ *  fenced code blocks. Must mirror extractHeadings() so the transcript jump
+ *  anchors line up 1:1 with the overlay's TOC entries. */
+export function injectHeadingJumpMarkers(markdown: string): string {
+  const lines = markdown.split("\n");
+  const out: string[] = [];
+  let inCode = false;
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      inCode = !inCode;
+      out.push(line);
+      continue;
+    }
+    if (!inCode && HEADING_RE.test(line)) {
+      out.push(JUMP_MARKER);
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/** Get the session entries backing both the transcript and the TOC. */
+function getSessionEntries(ctx: any): any[] {
+  try {
+    return ctx.sessionManager.buildContextEntries();
+  } catch {
+    return ctx.sessionManager.getBranch();
+  }
+}
+
+/** For each TOC item (same order as collectTocItems), the 0-based index of its
+ *  OSC 133 jump anchor in the rendered transcript document, or -1 when the item
+ *  has no anchor. Mirrors pi's built-in marker rules: user messages and
+ *  tool-call-free assistant messages get a start-of-message anchor, and our
+ *  markdown transformer adds one anchor per injected heading. */
+export function computeJumpAnchors(entries: any[]): number[] {
+  const anchors: number[] = [];
+  let marker = -1; // last assigned global marker index
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const role = entry.message?.role;
+    const text = extractText(entry.message);
+    if (!text) continue;
+    if (role === "user") {
+      anchors.push(++marker);
+    } else if (role === "assistant") {
+      const hasToolCalls =
+        Array.isArray(entry.message?.content) &&
+        entry.message.content.some((c: any) => c?.type === "toolCall");
+      // pi skips the start-of-message marker for assistant messages with tool
+      // calls (assistant-message.js renders early when hasToolCalls).
+      const builtIn = hasToolCalls ? 0 : 1;
+      const headings = extractHeadings(text);
+      if (headings.length > 0) {
+        for (let j = 0; j < headings.length; j++) {
+          anchors.push(marker + builtIn + 1 + j);
+        }
+        marker += builtIn + headings.length;
+      } else {
+        anchors.push(builtIn ? ++marker : -1);
+      }
+    } else {
+      anchors.push(-1);
+    }
+  }
+  return anchors;
+}
+
+/** Locate the box in the layout frame whose scrollView matches, and return its
+ *  rendered content lines (mirrors pi's getScrollViewBox + scrollContentLines). */
+function findScrollContentLines(root: any, scrollView: any): string[] | undefined {
+  const visit = (box: any): string[] | undefined => {
+    if (!box) return undefined;
+    if (box.scrollView === scrollView) return box.scrollContentLines;
+    for (const child of box.children ?? []) {
+      const found = visit(child);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return visit(root);
+}
+
+/** Scroll the fullscreen transcript so the k-th OSC 133 jump anchor (0-based)
+ *  sits at the top of the viewport. Returns true on success.
+ *
+ *  Relies on pi's internal viewport layout (currentLayout / primaryScrollView /
+ *  scrollContentLines). Every piece is guarded: any missing structure degrades
+ *  gracefully to false and the caller falls back to native ctrl+shift+↑/↓ hints. */
+export function jumpToMarkerIndex(tui: any, k: number): boolean {
+  try {
+    const layout = tui?.currentLayout;
+    const scrollView = layout?.primaryScrollView;
+    if (!layout?.root || !scrollView) return false;
+    const lines = findScrollContentLines(layout.root, scrollView);
+    if (!Array.isArray(lines)) return false;
+    let count = 0;
+    for (let row = 0; row < lines.length; row++) {
+      if (!OSC133_PROMPT_START.test(lines[row] ?? "")) continue;
+      if (count === k) {
+        scrollView.scrollTo(row);
+        tui.requestRender?.();
+        return true;
+      }
+      count++;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 /** Fixed overlay chrome rows outside the body viewport: top-border + header + rule + bottom-border. */
 const TOC_OVERLAY_CHROME_LINES = 4;
@@ -146,12 +285,7 @@ function buildLabel(item: TocItem, theme: any): string {
 /** Collect TOC items from the current session. */
 function collectTocItems(ctx: any): TocItem[] {
   const items: TocItem[] = [];
-  let entries: any[];
-  try {
-    entries = ctx.sessionManager.buildContextEntries();
-  } catch {
-    entries = ctx.sessionManager.getBranch();
-  }
+  const entries = getSessionEntries(ctx);
 
   for (const entry of entries) {
     if (entry.type !== "message") continue;
@@ -260,6 +394,9 @@ async function openToc(ctx: any) {
     ctx.ui.notify("No headings or user messages found in this session.", "warning");
     return;
   }
+  // Parallel to tocItems: the 0-based jump-anchor index (in the rendered
+  // transcript) for each TOC item, or -1 when the item has no anchor.
+  const jumpAnchors = computeJumpAnchors(getSessionEntries(ctx));
 
   const themeRef = ctx.ui.theme;
 
@@ -267,6 +404,9 @@ async function openToc(ctx: any) {
   let currentIdx = 0;
   let rightScrollOffset = 0; // how many lines the right preview is scrolled
   let followRight = false; // auto-scroll to bottom of preview on selection change; starts at top
+  // TUI mode is only known once the custom() factory receives the TUI instance;
+  // it is captured before overlayOptions() is evaluated (factory runs first).
+  let tuiMode: "regular" | "fullscreen" = "regular";
 
   // ── build SelectLists ────────────────────────────────────────────────────
   const items: SelectItem[] = tocItems.map((item, i) => ({
@@ -341,13 +481,55 @@ async function openToc(ctx: any) {
   // ── open overlay ─────────────────────────────────────────────────────────
   await ctx.ui.custom<void>(
     (tui, theme, _kb, done) => {
+      tuiMode = tui.mode;
+      const isFullscreen = tuiMode === "fullscreen";
+
       // Enable SGR mouse reporting so wheel / touchpad events reach handleInput.
-      tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+      // In fullscreen mode the TUI itself owns mouse reporting for the transcript
+      // viewport, so we must not touch it here (disabling it would break
+      // transcript wheel scrolling / selection).
+      if (!isFullscreen) {
+        tui.terminal?.write?.("\x1b[?1000h\x1b[?1006h");
+      }
 
       const render = (width: number): string[] => {
         const dialogWidth = Math.max(24, width);
         const innerWidth = Math.max(22, dialogWidth - 2);
 
+        // ── fullscreen sidebar: single-column TOC, transcript live on the right ──
+        if (isFullscreen) {
+          const rawList = selectList.render(innerWidth);
+          const listLines = rawList.map(sanitizeRenderedLine);
+
+          const bodyLines: string[] = [];
+          for (let i = 0; i < viewportHeight; i++) {
+            bodyLines.push(listLines[i] ?? "");
+          }
+
+          const hint = theme.fg(
+            "dim",
+            `↑↓ · ctrl+shift+↑/↓ jump · esc close`,
+          );
+          const count = theme.fg("accent", `${currentIdx + 1}/${tocItems.length}`);
+          const headerStr =
+            visibleWidth(hint) + visibleWidth(count) + 2 <= innerWidth
+              ? `${hint}${" ".repeat(
+                  innerWidth - visibleWidth(hint) - visibleWidth(count),
+                )}${count}`
+              : hint;
+
+          const lines: string[] = [];
+          lines.push(borderLine(innerWidth, "top", theme));
+          lines.push(frameLine(headerStr, innerWidth, theme));
+          lines.push(ruleLine(innerWidth, theme));
+          for (const bl of bodyLines) {
+            lines.push(frameLine(bl, innerWidth, theme));
+          }
+          lines.push(borderLine(innerWidth, "bottom", theme));
+          return lines;
+        }
+
+        // ── regular dialog: two-panel TOC + preview (unchanged) ────────────────
         // Split body into left / right
         const leftW = Math.max(24, Math.floor(innerWidth * 0.5));
         const sepStr = theme.fg("warning", " │ ");
@@ -432,16 +614,31 @@ async function openToc(ctx: any) {
           markdown.invalidate();
         },
         handleInput(data: string) {
-          // Mouse scroll
-          const mouseDelta = getMouseScrollDelta(data);
-          if (mouseDelta !== null) {
-            followRight = false;
-            rightScrollOffset = Math.max(
-              0,
-              rightScrollOffset + mouseDelta,
-            );
-            tui.requestRender();
-            return;
+          // In fullscreen mode the TUI viewport consumes mouse wheel, pageUp/
+          // pageDown (transcript scroll) and ctrl+shift+up/down (marked-message
+          // jump) before this overlay ever sees them. Only arrow navigation and
+          // the shortcuts below reach us.
+          if (!isFullscreen) {
+            // Mouse scroll
+            const mouseDelta = getMouseScrollDelta(data);
+            if (mouseDelta !== null) {
+              followRight = false;
+              rightScrollOffset = Math.max(
+                0,
+                rightScrollOffset + mouseDelta,
+              );
+              tui.requestRender();
+              return;
+            }
+
+            if (matchesKey(data, "page_up") || matchesKey(data, "page_down")) {
+              followRight = false;
+              const step = viewportHeight - 2;
+              const delta = matchesKey(data, "page_up") ? -step : step;
+              rightScrollOffset = Math.max(0, rightScrollOffset + delta);
+              tui.requestRender();
+              return;
+            }
           }
 
           if (matchesKey(data, "escape")) {
@@ -449,12 +646,24 @@ async function openToc(ctx: any) {
             return;
           }
 
-          if (matchesKey(data, "page_up") || matchesKey(data, "page_down")) {
-            followRight = false;
-            const step = viewportHeight - 2;
-            const delta = matchesKey(data, "page_up") ? -step : step;
-            rightScrollOffset = Math.max(0, rightScrollOffset + delta);
-            tui.requestRender();
+          // Fullscreen sidebar: Enter jumps the transcript to the selected
+          // heading/message anchor, then closes the panel. Falls back to native
+          // ctrl+shift+↑/↓ hints when pi's internal viewport layout is not
+          // available (different pi version or regular mode).
+          if (isFullscreen && matchesKey(data, "enter")) {
+            const k = jumpAnchors[currentIdx] ?? -1;
+            if (k >= 0) {
+              if (jumpToMarkerIndex(tui, k)) {
+                done();
+              } else {
+                ctx.ui.notify(
+                  "Jump unavailable in this pi version — use Ctrl+Shift+↑/↓ in fullscreen mode",
+                  "info",
+                );
+              }
+            } else {
+              ctx.ui.notify("This entry has no jump anchor", "info");
+            }
             return;
           }
 
@@ -478,17 +687,28 @@ async function openToc(ctx: any) {
           }
         },
         dispose() {
-          tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+          if (!isFullscreen) {
+            tui.terminal?.write?.("\x1b[?1000l\x1b[?1006l");
+          }
         },
       };
     },
     {
       overlay: true,
-      overlayOptions: {
-        anchor: "center",
-        width: "100%",
-        maxHeight: "100%",
-      },
+      // Mode-dependent placement: sidebar (fullscreen) vs centered dialog.
+      // Evaluated after the factory captures tui.mode.
+      overlayOptions: () =>
+        tuiMode === "fullscreen"
+          ? {
+              anchor: "left-center",
+              width: "45%",
+              maxHeight: "100%",
+            }
+          : {
+              anchor: "center",
+              width: "100%",
+              maxHeight: "100%",
+            },
     },
   );
 }
@@ -496,6 +716,23 @@ async function openToc(ctx: any) {
 // ── extension entry ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // Fullscreen jump anchors (pi >= 0.84): the fullscreen TUI scans rendered
+  // transcript lines for OSC 133 prompt markers to implement "jump to previous/
+  // next marked message" (tui.altScreen.previousPrompt/nextPrompt, default
+  // ctrl+shift+up/down). Injecting a marker before every assistant heading turns
+  // the native message-level jump into a heading-level jump.
+  //
+  // Official display-only hook (pi.registerMarkdownTransformer, added in 0.84):
+  // transforms the markdown before rendering; the session and LLM context are
+  // untouched, consistent with this extension's zero-timeline-injection design.
+  // Guarded so older pi versions (without the hook) keep the basic TOC command.
+  if (typeof pi.registerMarkdownTransformer === "function") {
+    pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) => {
+      if (isStreaming || messageType !== "assistant") return markdown;
+      return injectHeadingJumpMarkers(markdown);
+    });
+  }
+
   pi.registerCommand("toc", {
     description: "Open Markdown table-of-contents outline",
     handler: async (_args, ctx) => openToc(ctx),
